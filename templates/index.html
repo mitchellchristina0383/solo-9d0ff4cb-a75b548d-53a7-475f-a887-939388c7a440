@@ -3,156 +3,108 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>VPN 换线 · MTU 黑洞演练台</title>
+  <title>双线路 VPN 接入 · 网段重叠与回程核查</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
 <header class="topbar">
   <div>
-    <h1>VPN 换线 · 大包卡住演练台</h1>
+    <h1>双线路 VPN 接入 · 网段重叠 / 别名映射核查台</h1>
     <p class="subtitle">
-      报文置 DF 禁止分片：<code>载荷 + 封装开销 &gt; 线路 MTU</code> 即丢弃。
-      可连续发包、乱序回执、触发超时、投递超长通知，或在回执前换线立即重发。
+      两分支分别接在 VPN 的 A、B 线上且内网网段重叠。逐条填报
+      <code>原网段 CIDR → 总部别名 CIDR</code>（等长前缀、保留主机位平移），
+      核查覆盖待接入网段的<strong>全部地址</strong>（区间运算，不逐地址扫描）。
     </p>
   </div>
-  <div id="completeBanner" class="complete-banner hidden">✅ 全部字节已确认，传完！</div>
 </header>
 
 <main class="layout">
-  <!-- 左列：参数 + 控制台 -->
-  <section class="col-left">
-    <div class="card">
-      <h2>① 演练参数</h2>
-      <div class="form-grid">
-        <label class="field">
-          <span>报表字节数</span>
-          <input id="cfg-total" type="number" min="1" max="1000000" value="10000">
-        </label>
-        <label class="field">
-          <span>起始载荷（字节）</span>
-          <input id="cfg-start" type="number" min="1" max="65535" value="1400">
-        </label>
-        <label class="field">
-          <span>超时缩包步长</span>
-          <input id="cfg-step" type="number" min="1" max="65535" value="200">
-        </label>
-      </div>
+  <!-- 左：两线输入 -->
+  <section class="col-input">
+    <div class="card" id="cardA">
+      <h2>线路 <span class="badge badge-a">A</span> 待接入配置</h2>
+      <label class="field">
+        <span>待接入网段（每行一个 IPv4 CIDR，# 后可写注释）</span>
+        <textarea id="segA" rows="4" spellcheck="false"
+          placeholder="10.0.0.0/24"></textarea>
+      </label>
+      <label class="field">
+        <span>映射规则（每行：<code>[名称:] 原CIDR -&gt; 别名CIDR</code>，等长前缀）</span>
+        <textarea id="ruleA" rows="7" spellcheck="false"
+          placeholder="A1: 10.0.0.0/24 -> 172.16.0.0/24"></textarea>
+      </label>
+    </div>
 
-      <div class="lines-grid">
-        <div class="line-cfg line-a">
-          <h3>线路 A <small id="eff-A"></small></h3>
-          <label class="field"><span>MTU</span>
-            <input id="cfg-A-mtu" type="number" value="1500" min="1" max="65535"></label>
-          <label class="field"><span>封装开销</span>
-            <input id="cfg-A-overhead" type="number" value="120" min="0" max="65535"></label>
-          <label class="check"><input id="cfg-A-notify" type="checkbox">
-            <span>返回超长通知（ICMP too-big）</span></label>
-        </div>
-        <div class="line-cfg line-b">
-          <h3>线路 B <small id="eff-B"></small></h3>
-          <label class="field"><span>MTU</span>
-            <input id="cfg-B-mtu" type="number" value="1500" min="1" max="65535"></label>
-          <label class="field"><span>封装开销</span>
-            <input id="cfg-B-overhead" type="number" value="60" min="0" max="65535"></label>
-          <label class="check"><input id="cfg-B-notify" type="checkbox" checked>
-            <span>返回超长通知（ICMP too-big）</span></label>
-        </div>
-      </div>
-
-      <div class="row wrap">
-        <button class="btn primary" id="btnReset">应用参数并重置演练</button>
-        <button class="btn ghost" data-preset="blackhole">预设：A 静默黑洞</button>
-        <button class="btn ghost" data-preset="icmp">预设：A 有超长通知</button>
-      </div>
-      <p class="hint">修改参数后需点击“应用参数并重置演练”生效。</p>
+    <div class="card" id="cardB">
+      <h2>线路 <span class="badge badge-b">B</span> 待接入配置</h2>
+      <label class="field">
+        <span>待接入网段（每行一个 IPv4 CIDR，# 后可写注释）</span>
+        <textarea id="segB" rows="4" spellcheck="false"
+          placeholder="10.0.0.0/24"></textarea>
+      </label>
+      <label class="field">
+        <span>映射规则（每行：<code>[名称:] 原CIDR -&gt; 别名CIDR</code>，等长前缀）</span>
+        <textarea id="ruleB" rows="7" spellcheck="false"
+          placeholder="B1: 10.0.0.0/24 -> 172.17.0.0/24"></textarea>
+      </label>
     </div>
 
     <div class="card">
-      <h2>② 发包 / 换线控制台</h2>
-      <div id="statusChips" class="chips"></div>
-
       <div class="row wrap">
-        <button class="btn" id="btnSendOne">发下一包</button>
-        <label class="inline">连发包数
-          <input id="burstCount" type="number" min="1" max="5000" value="8" class="mini">
-        </label>
-        <button class="btn" id="btnBurst">连续发包</button>
-        <button class="btn" id="btnBurstAll">连续发完剩余新包</button>
-        <button class="btn warn" id="btnResendMissing">重发全部未确认</button>
+        <button class="btn primary" id="btnCheck">▶ 开始核查</button>
+        <button class="btn ghost" data-preset="hijack">预设① 回程被更长前缀接走</button>
+        <button class="btn ghost" data-preset="ambiguity">预设② 同长并列歧义</button>
+        <button class="btn ghost" data-preset="clean">预设③ 干净基线</button>
+        <button class="btn ghost" id="btnClear">清空</button>
       </div>
-
-      <div class="row wrap switch-row">
-        <span class="switch-label">回执到达前换线：</span>
-        <button class="btn line-a-bg" id="btnSwitchA">换到线路 A 并立即重发</button>
-        <button class="btn line-b-bg" id="btnSwitchB">换到线路 B 并立即重发</button>
-      </div>
-      <p class="hint">换线会把载荷重置为“起始载荷”、轮次 +1，并按新载荷重发所有尚未确认的字节；
-        旧线上的在途报文仍可回执。</p>
-
-      <div class="progress-block">
-        <div class="progress-head">
-          <strong>累计确认：<span id="ackedBytes">0</span> / <span id="totalBytes">0</span> 字节</strong>
-          <span id="ackedPct">0%</span>
-        </div>
-        <div class="progress"><div id="progressBar" class="progress-bar"></div></div>
-        <div id="rangeChips" class="range-chips"></div>
-        <div id="coverageMap" class="coverage-map" title="确认区间覆盖图"></div>
-      </div>
+      <p class="hint">
+        规则：去程在<strong>本线路</strong>按原前缀最长匹配，同线路原前缀重复直接退回；
+        回程在<strong>两线全部规则</strong>按别名前缀最长匹配，同长并列算歧义。
+        主机位在转换中原样保留。
+      </p>
     </div>
 
-    <div class="card">
-      <h2>③ 回包顺序（也可直接点每包上的按钮）</h2>
-      <div class="row wrap">
-        <label class="inline">批量回执顺序
-          <select id="ackOrder">
-            <option value="asc">按编号正序</option>
-            <option value="desc">按编号逆序</option>
-            <option value="random" selected>随机乱序</option>
-          </select>
-        </label>
-        <button class="btn ok" id="btnAckAll">依次回执所有在途可收包</button>
-        <button class="btn ok ghost" id="btnAckRandom">只随机回执一个</button>
-        <span class="hint" id="ackHelper"></span>
-      </div>
+    <div class="card hidden" id="cardErrors">
+      <h2 class="err-title">✖ 输入校验未通过</h2>
+      <ul id="errorList" class="error-list"></ul>
     </div>
   </section>
 
-  <!-- 右列：报文列表 + 时间线 -->
-  <section class="col-right">
-    <div class="card packets-card">
-      <h2>④ 报文列表（线路 / 长度 / 字节范围 / 操作）</h2>
+  <!-- 右：结果 -->
+  <section class="col-result">
+    <div class="card" id="cardSummary">
+      <h2>核查汇总</h2>
+      <div id="summary" class="summary-grid">
+        <p class="hint">尚未核查。填好两线网段与规则后点“开始核查”。</p>
+      </div>
+    </div>
+
+    <div class="card hidden" id="cardMapping">
+      <h2>去程映射表（本线路最长匹配结果）</h2>
       <div class="table-wrap">
-        <table class="packets-table">
+        <table class="data-table">
           <thead>
-          <tr>
-            <th>#</th><th>轮次</th><th>线路</th><th>类型</th>
-            <th>载荷长度</th><th>封装后</th><th>字节范围 [起,止)</th>
-            <th>状态（发送端 / 上帝视角）</th><th>操作</th>
-          </tr>
+          <tr><th>线路</th><th>命中规则</th><th>原地址范围</th><th>总部别名范围</th></tr>
           </thead>
-          <tbody id="packetRows">
-          <tr><td colspan="9" class="empty">还没有报文，先在上方发包。</td></tr>
-          </tbody>
+          <tbody id="mappingRows"></tbody>
         </table>
       </div>
     </div>
 
-    <div class="card">
-      <h2>⑤ 事件时间线</h2>
-      <div id="timeline" class="timeline"></div>
-    </div>
+    <div class="findings-stack" id="findingsStack"></div>
   </section>
 </main>
 
 <footer class="footer">
   <details>
-    <summary>规则与实现说明</summary>
+    <summary>判定口径与实现说明</summary>
     <ul>
-      <li>字节从 0 开始编号，区间一律左闭右开，如 <code>[0, 1400)</code> 表示第 1～1400 字节。</li>
-      <li>“上帝视角”标出了线路上真实发生的丢弃；静默丢弃的包在发送端仍显示在途，只能由你点“触发超时”。</li>
-      <li>每包带轮次号。投递超长通知或触发超时时，只有属于当前轮次的包能缩包；处理一次后轮次 +1，旧包的信号只记录、不缩包。</li>
-      <li>已确认字节用合并区间并集维护，重叠回执新增 0 字节，不重复计数。</li>
-      <li>重发 / 换线重发打包时跳过已确认区间，只携带尚未确认的连续字节，因此可能比设定载荷短或被已确认区间截断。</li>
+      <li>每条规则的原 CIDR 与别名 CIDR <strong>必须等长</strong>，转换即整数平移，主机位逐位保留。</li>
+      <li>去程仅在<strong>本线路</strong>规则中按原前缀做最长匹配；同线路原前缀重复属于配置错误，整单退回。</li>
+      <li>回程在 A、B 两线<strong>全部规则</strong>中按别名前缀最长匹配：唯一最长 → 回该规则所在线路；同长并列 → 歧义。</li>
+      <li>同一别名地址被多个来源占用即“别名冲突”；两条线路上的同一原地址视为两个来源。</li>
+      <li>回程命中规则所在线路与来源线路不同 → “回错线路”；按该规则反算的原地址与来源原地址不同 → “回错地址”（可与回错线路同时出现）。</li>
+      <li>全部判断基于 32 位整数区间（左闭右开）做切分与合并，输出均为地址范围；<strong>不逐地址扫描</strong>，支持 /0 级大网段。</li>
     </ul>
   </details>
 </footer>

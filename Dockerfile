@@ -13,6 +13,6 @@ COPY . .
 
 EXPOSE 8000
 
-# 内存态演练台必须固定 1 个 worker；多线程即可满足单人/小班演练。
+# 纯计算服务、无共享可变状态；固定 1 个 worker + 多线程即可。
 CMD ["gunicorn", "-w", "1", "--threads", "8", "-k", "gthread", \
      "-b", "0.0.0.0:8000", "--timeout", "30", "app:app"]

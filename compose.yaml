@@ -1,8 +1,8 @@
 services:
-  vpn-mtu-drill:
+  vpn-route-check:
     build: .
-    image: vpn-mtu-drill:latest
-    container_name: vpn-mtu-drill
+    image: vpn-route-check:latest
+    container_name: vpn-route-check
     ports:
       - "8000:8000"
     restart: unless-stopped

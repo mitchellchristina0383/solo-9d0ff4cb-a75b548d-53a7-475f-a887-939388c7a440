@@ -1,358 +1,241 @@
-/* VPN MTU 演练台前端：原生 JS，无外部依赖。 */
+/* 双线路 VPN 网段重叠核查 —— 前端逻辑（无框架、无依赖）。 */
 "use strict";
-
-let STATE = null;
-let refreshSeq = 0;
-let batchRunning = false;
 
 const $ = (id) => document.getElementById(id);
 
-function showToast(msg, isError = false) {
-  const t = $("toast");
-  t.textContent = msg;
-  t.className = "toast" + (isError ? " error" : "");
-  clearTimeout(showToast._timer);
-  showToast._timer = setTimeout(() => t.classList.add("hidden"), 3200);
-}
-
-async function api(path, body) {
-  const opts = {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: body === undefined ? "{}" : JSON.stringify(body),
-  };
-  const resp = await fetch(path, opts);
-  let data = null;
-  try { data = await resp.json(); } catch (_e) { /* 非 JSON */ }
-  if (!resp.ok || (data && data.ok === false)) {
-    throw new Error((data && data.error) || `请求失败（HTTP ${resp.status}）`);
-  }
-  return data;
-}
-
-/* 所有写操作统一走 act：报错弹 toast，成功用响应里的 state 渲染。 */
-async function act(path, body, okMsg) {
-  try {
-    const data = await api(path, body);
-    if (data.state) {
-      /* 使写操作之前发出、可能晚到的轮询响应失效，避免旧 state 覆盖新界面 */
-      refreshSeq += 1;
-      render(data.state);
-    } else {
-      loadState();
-    }
-    if (okMsg) showToast(okMsg);
-    return data;
-  } catch (err) {
-    showToast(err.message, true);
-    /* 出错后仍刷新一次，保证界面与服务端一致 */
-    loadState();
-    return null;
-  }
-}
-
-async function loadState() {
-  const seq = ++refreshSeq;
-  try {
-    const resp = await fetch("/api/state");
-    const data = await resp.json();
-    if (seq !== refreshSeq || !data.ok) return;
-    render(data.state);
-  } catch (_e) { /* 轮询失败静默 */ }
-}
-
-/* ---------------- 参数表单 ---------------- */
-
-function readConfig() {
-  return {
-    total_bytes: Number($("cfg-total").value),
-    start_payload: Number($("cfg-start").value),
-    timeout_step: Number($("cfg-step").value),
-    lines: {
-      A: {
-        mtu: Number($("cfg-A-mtu").value),
-        overhead: Number($("cfg-A-overhead").value),
-        notify: $("cfg-A-notify").checked,
-      },
-      B: {
-        mtu: Number($("cfg-B-mtu").value),
-        overhead: Number($("cfg-B-overhead").value),
-        notify: $("cfg-B-notify").checked,
-      },
-    },
-  };
-}
-
-function refreshEffLabels() {
-  for (const k of ["A", "B"]) {
-    const mtu = Number($(`cfg-${k}-mtu`).value);
-    const oh = Number($(`cfg-${k}-overhead`).value);
-    const eff = mtu - oh;
-    const start = Number($("cfg-start").value);
-    const fit = eff >= start;
-    $(`eff-${k}`).innerHTML =
-      `最大载荷 <b style="color:${eff > 0 ? "#334155" : "#dc2626"}">${eff}</b>` +
-      (start > 0 ? ` · 起始包${fit ? "<span style='color:#059669'>可过</span>"
-                                  : "<span style='color:#dc2626'>必超</span>"}` : "");
-  }
-}
-
-function applyPreset(name) {
-  const set = (id, v) => { $(id).value = v; };
-  if (name === "blackhole") {
-    set("cfg-total", 10000); set("cfg-start", 1400); set("cfg-step", 200);
-    set("cfg-A-mtu", 1500); set("cfg-A-overhead", 120); $("cfg-A-notify").checked = false;
-    set("cfg-B-mtu", 1500); set("cfg-B-overhead", 60);  $("cfg-B-notify").checked = true;
-  } else {
-    set("cfg-A-mtu", 1500); set("cfg-A-overhead", 120); $("cfg-A-notify").checked = true;
-    set("cfg-B-mtu", 1500); set("cfg-B-overhead", 60);  $("cfg-B-notify").checked = true;
-  }
-  refreshEffLabels();
-}
-
-/* ---------------- 渲染 ---------------- */
-
-const KIND_TEXT = {
-  new: "新发", missing: "重发缺口", timeout: "超时重发", switch: "换线重发",
+const PRESETS = {
+  // ① 回程被更长前缀接走：B1 的别名 /25 落在 A1 别名 /24 内，回程截胡
+  hijack: {
+    segA: "10.0.0.0/24   # A 分支待接入整段",
+    ruleA: "A1: 10.0.0.0/24 -> 172.16.0.0/24",
+    segB: "10.0.99.128/25  # B 分支待接入（与 A 原网段重叠的是别名侧）",
+    ruleB: "B1: 10.0.99.128/25 -> 172.16.0.128/25  # 别名与 A1 重叠且前缀更长，回程被它接走",
+  },
+  // ② 两线同一别名前缀同长并列
+  ambiguity: {
+    segA: "10.0.0.0/24",
+    ruleA: "A1: 10.0.0.0/24 -> 172.16.0.0/24",
+    segB: "10.0.0.0/24",
+    ruleB: "B1: 10.0.0.0/24 -> 172.16.0.0/24",
+  },
+  // ③ 干净基线：别名不重叠，无冲突无歧义
+  clean: {
+    segA: "10.0.0.0/24\n10.1.0.0/24",
+    ruleA:
+      "A1: 10.0.0.0/24 -> 172.16.0.0/24\n" +
+      "A2: 10.1.0.0/24 -> 172.16.1.0/24",
+    segB: "10.0.0.0/24",
+    ruleB: "B1: 10.0.0.0/24 -> 172.17.0.0/24",
+  },
 };
 
-function pct(part, all) { return all > 0 ? (part / all * 100) : 0; }
-
-function render(s) {
-  STATE = s;
-  renderChips(s);
-  renderProgress(s);
-  renderPackets(s);
-  renderTimeline(s);
-  $("completeBanner").classList.toggle("hidden", !s.complete);
-  for (const id of ["btnSendOne", "btnBurst", "btnBurstAll", "btnResendMissing",
-                    "btnSwitchA", "btnSwitchB"]) {
-    $(id).disabled = s.complete;
-  }
+function esc(v) {
+  return String(v ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
-function renderChips(s) {
-  const lc = s.config.lines[s.active_line];
-  $("statusChips").innerHTML = `
-    <span class="chip line-${s.active_line}">当前线路：<b>${lc.label}</b>
-      （MTU ${lc.mtu} / 开销 ${lc.overhead} / 最大载荷 ${lc.max_payload} /
-      通知 ${lc.notify ? "开" : "关"}）</span>
-    <span class="chip">当前试发载荷：<b>${s.cur_payload}</b> 字节</span>
-    <span class="chip">起始载荷：<b>${s.config.start_payload}</b></span>
-    <span class="chip">当前轮次：<b>第 ${s.round} 轮</b></span>
-    <span class="chip">新字节推进位置：<b>${s.next_offset}</b> / ${s.config.total_bytes}</span>`;
+function ruleId(r) {
+  return `${r.line}#${r.index}${r.name ? `（${r.name}）` : ""}`;
 }
 
-function renderProgress(s) {
-  const total = s.config.total_bytes;
-  $("ackedBytes").textContent = s.acked_count;
-  $("totalBytes").textContent = total;
-  const p = pct(s.acked_count, total);
-  $("ackedPct").textContent = p.toFixed(1) + "%";
-  $("progressBar").style.width = p + "%";
-
-  const ranges = s.acked_ranges || [];
-  const shown = ranges.slice(0, 24);
-  let chips = shown.map(([a, b]) => `<span class="range-chip">[${a}, ${b})</span>`).join("");
-  if (ranges.length > shown.length) chips += `<span class="range-chip">…另有 ${ranges.length - shown.length} 段</span>`;
-  if (!ranges.length) chips = `<span class="hint">尚无确认区间</span>`;
-  $("rangeChips").innerHTML = chips;
-
-  /* 覆盖图：绿色为已确认区间，彩色描边小条为每个报文的字节范围 */
-  const ackSegs = ranges.map(([a, b]) =>
-    `<div class="seg" style="left:${pct(a, total)}%;width:${pct(b - a, total)}%"></div>`).join("");
-  const ticks = s.packets.map((pkt) => {
-    const color = pkt.line === "A" ? "var(--a)" : "var(--b)";
-    const op = pkt.status === "acked" ? ".25" : pkt.status === "timeout" ? ".45" : ".9";
-    return `<div class="pkt-tick" title="#${pkt.id} ${pkt.line}线 [${pkt.start},${pkt.end}) ${pkt.status}"
-      style="left:${pct(pkt.start, total)}%;width:${Math.max(pct(pkt.end - pkt.start, total), .25)}%;
-             border-color:${color};opacity:${op}"></div>`;
-  }).join("");
-  $("coverageMap").innerHTML = ackSegs + ticks;
+function rangesHtml(ranges) {
+  return ranges
+    .map((r) => `<code class="cidr">${esc(r.label)}</code>
+                 <span class="size">${r.size} 个地址</span>`)
+    .join("<br>");
 }
 
-function statusCell(p) {
-  let proto = "";
-  if (p.status === "outstanding") proto = `<span class="tag st-out">在途未回执</span>`;
-  if (p.status === "acked") proto = `<span class="tag st-acked">已确认</span>`;
-  if (p.status === "timeout") proto = `<span class="tag st-timeout">已超时</span>`;
-  if (p.late_ack) proto += `<span class="tag late">迟到回执</span>`;
-
-  let phys = "";
-  if (p.physical === "in_flight") phys = `<span class="tag ph-ok">实际在途·可回执</span>`;
-  if (p.physical === "silent_drop") phys = `<span class="tag ph-silent">上帝视角：静默丢弃</span>`;
-  if (p.physical === "notify_drop") phys = `<span class="tag ph-notify">上帝视角：已丢弃·有超长通知</span>`;
-
-  let notice = "";
-  if (p.notice_state === "pending") notice = `<span class="tag notice-pending">超长通知待投递</span>`;
-  if (p.notice_state === "applied") notice = `<span class="tag notice-applied">通知已用于缩包</span>`;
-  if (p.notice_state === "ignored") notice = `<span class="tag notice-ignored">过期通知·已忽略</span>`;
-
-  return `<div style="display:flex;flex-direction:column;gap:3px;align-items:flex-start">
-            <div>${proto}</div><div>${phys}</div>${notice ? `<div>${notice}</div>` : ""}
-          </div>`;
+function refsHtml(refs) {
+  return refs.map((r) => `<code>${esc(r.cidr || r.original || "")}</code>`).join(" ");
 }
 
-function actionsCell(p) {
-  if (p.status === "acked") return `<span class="hint">—</span>`;
-  const btns = [];
-  if (p.physical === "in_flight") {
-    const label = p.status === "timeout" ? "补到迟到回执" : "回执 ACK";
-    btns.push(`<button class="btn tiny ok" data-act="ack" data-id="${p.id}">${label}</button>`);
-  }
-  if (p.status === "outstanding") {
-    btns.push(`<button class="btn tiny danger" data-act="timeout" data-id="${p.id}">触发超时</button>`);
-  }
-  if (p.notice_state === "pending") {
-    btns.push(`<button class="btn tiny warn" data-act="notice" data-id="${p.id}">投递超长通知</button>`);
-  }
-  return `<div class="actions-cell">${btns.join("") || '<span class="hint">无可用操作</span>'}</div>`;
+function toast(msg) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.classList.remove("hidden");
+  clearTimeout(toast._timer);
+  toast._timer = setTimeout(() => t.classList.add("hidden"), 2500);
 }
 
-function renderPackets(s) {
-  const tb = $("packetRows");
-  if (!s.packets.length) {
-    tb.innerHTML = `<tr><td colspan="9" class="empty">还没有报文，先在上方发包。</td></tr>`;
+async function runCheck() {
+  const body = {
+    A: { segments_text: $("segA").value, rules_text: $("ruleA").value },
+    B: { segments_text: $("segB").value, rules_text: $("ruleB").value },
+  };
+  let resp;
+  try {
+    resp = await fetch("/api/check", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    toast("请求失败：" + e);
     return;
   }
-  const rows = s.packets.slice().reverse().map((p) => {
-    const rowCls = p.status === "acked" ? "row-acked"
-      : p.status === "timeout" ? "row-timeout"
-      : p.physical !== "in_flight" ? "row-drop" : "";
-    const overWire = p.wire_size > s.config.lines[p.line].mtu;
-    return `<tr class="${rowCls}">
-      <td class="mono"><b>#${p.id}</b></td>
-      <td><span class="tag round">第 ${p.round} 轮</span></td>
-      <td><span class="tag line-${p.line}">线路 ${p.line}</span></td>
-      <td><span class="tag kind">${KIND_TEXT[p.kind] || p.kind}</span></td>
-      <td class="mono">${p.size}</td>
-      <td class="mono" style="${overWire ? "color:#dc2626;font-weight:700" : ""}">
-        ${p.wire_size}${overWire ? " ✗超MTU" : ""}</td>
-      <td class="mono">[${p.start}, ${p.end})</td>
-      <td>${statusCell(p)}</td>
-      <td>${actionsCell(p)}</td>
-    </tr>`;
-  }).join("");
-  tb.innerHTML = rows;
-}
-
-function renderTimeline(s) {
-  const el = $("timeline");
-  const events = (s.events || []).slice().reverse();
-  el.innerHTML = events.map((e) => `
-    <div class="ev ${e.kind}">
-      <span class="t">${e.time}</span><span class="dot"></span>
-      <span class="ev-text">${escapeHtml(e.text)}</span>
-    </div>`).join("");
-}
-
-function escapeHtml(str) {
-  return String(str).replace(/[&<>"']/g, (c) => (
-    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-}
-
-/* ---------------- 批量回执（任选顺序） ---------------- */
-
-function eligiblePackets(s) {
-  return s.packets.filter((p) => p.physical === "in_flight" && p.status === "outstanding");
-}
-
-async function ackOne(pid) {
-  return act(`/api/packets/${pid}/ack`);
-}
-
-async function batchAck(mode) {
-  if (batchRunning || !STATE) return;
-  let list = eligiblePackets(STATE);
-  if (!list.length) { showToast("当前没有可回执的在途包", true); return; }
-  if (mode === "random-one") {
-    const p = list[Math.floor(Math.random() * list.length)];
-    await ackOne(p.id);
+  const data = await resp.json();
+  if (!resp.ok || !data.ok) {
+    showErrors(data.validation_errors || [{ message: data.error || "核查失败" }]);
     return;
   }
-  const order = $("ackOrder").value;
-  if (mode === "all") {
-    if (order === "desc") list.sort((a, b) => b.id - a.id);
-    else if (order === "asc") list.sort((a, b) => a.id - b.id);
-    else {
-      for (let i = list.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [list[i], list[j]] = [list[j], list[i]];
-      }
-    }
-    batchRunning = true;
-    setBatchDisabled(true);
-    $("ackHelper").textContent = `按${order === "random" ? "随机乱序" : order === "asc" ? "正序" : "逆序"}依次回执 ${list.length} 个包…`;
-    for (const p of list) {
-      /* 用最新状态再确认一次该包仍可回执 */
-      const fresh = STATE && STATE.packets.find((x) => x.id === p.id);
-      if (!fresh || fresh.physical !== "in_flight" || fresh.status !== "outstanding") continue;
-      // eslint-disable-next-line no-await-in-loop
-      const r = await ackOne(p.id);
-      if (!r) break;
-      // eslint-disable-next-line no-await-in-loop
-      await new Promise((res) => setTimeout(res, 160));
-    }
-    $("ackHelper").textContent = "本轮批量回执完成。";
-    setBatchDisabled(false);
-    batchRunning = false;
+  $("cardErrors").classList.add("hidden");
+  render(data);
+}
+
+function showErrors(errors) {
+  const card = $("cardErrors");
+  card.classList.remove("hidden");
+  $("errorList").innerHTML = errors
+    .map((e) => `<li><span class="line-tag">${esc(e.line || "全局")}</span>
+                 <span class="field-tag">${esc(e.field || "")}</span>
+                 ${esc(e.message)}</li>`)
+    .join("");
+  card.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+function render(data) {
+  renderSummary(data);
+  renderMapping(data);
+  renderFindings(data.findings);
+}
+
+function renderSummary(data) {
+  const s = data.summary;
+  const c = s.finding_counts;
+  const items = [
+    { label: "待核查地址总数", value: s.address_total, cls: "neutral" },
+    { label: "去程已映射", value: s.address_mapped, cls: "ok" },
+    { label: "去程未映射", value: s.address_unmapped, cls: c.unmapped_outbound ? "bad" : "ok" },
+    { label: "别名冲突地址", value: s.alias_conflict_addresses, cls: c.alias_conflicts ? "bad" : "ok" },
+    { label: "回程歧义地址", value: s.return_ambiguity_addresses, cls: c.return_ambiguity ? "bad" : "ok" },
+    { label: "回错线路地址", value: s.wrong_line_addresses, cls: c.wrong_line ? "bad" : "ok" },
+    { label: "回错地址数", value: s.wrong_address_addresses, cls: c.wrong_address ? "bad" : "ok" },
+  ];
+  $("summary").innerHTML = items
+    .map((i) => `<div class="stat ${i.cls}">
+                   <div class="stat-num">${i.value.toLocaleString()}</div>
+                   <div class="stat-label">${i.label}</div></div>`)
+    .join("");
+
+  const lineBits = ["A", "B"].map((k) => {
+    const st = data.lines[k];
+    return `<div class="line-stat line-${k.toLowerCase()}">
+      <strong>线路 ${k}</strong>：${st.segment_count} 个网段 / ${st.rule_count} 条规则，
+      共 ${st.address_total} 地址（已映射 ${st.address_mapped}，未映射 ${st.address_unmapped}）
+    </div>`;
+  }).join("");
+  $("summary").insertAdjacentHTML("beforeend", `<div class="line-stats">${lineBits}</div>`);
+}
+
+function renderMapping(data) {
+  const rows = data.outbound_mapping;
+  $("cardMapping").classList.toggle("hidden", rows.length === 0);
+  $("mappingRows").innerHTML = rows
+    .map((m) => `<tr>
+      <td><span class="badge badge-${m.line.toLowerCase()}">${m.line}</span></td>
+      <td><code>${esc(ruleId(m.rule))}</code><br>
+          <small class="hint">${esc(m.rule.original)} → ${esc(m.rule.alias)}</small></td>
+      <td>${rangesHtml([m.original_range])}</td>
+      <td>${rangesHtml([m.alias_range])}</td>
+    </tr>`)
+    .join("");
+}
+
+const FINDING_META = [
+  {
+    key: "unmapped_outbound", title: "① 去程未映射（本线路无原前缀命中）",
+    bad: true,
+    body: (e) => `
+      <div class="meta-row"><span class="line-tag">线路 ${esc(e.line)}</span>
+        涉及网段：${refsHtml(e.segments)}</div>
+      <div class="range-row">未映射地址范围：<br>${rangesHtml(e.ranges)}</div>`,
+  },
+  {
+    key: "alias_conflicts", title: "② 别名冲突（一个别名对应多个来源）",
+    bad: true,
+    body: (e) => `
+      <div class="range-row">冲突别名范围：<br>${rangesHtml(e.ranges)}</div>
+      <div class="meta-row">来源（${e.sources.length} 个）：
+        <ul class="sub-list">${e.sources
+          .map((s) => `<li><span class="line-tag">线路 ${esc(s.line)}</span>
+            规则 <code>${esc(ruleId(s.rule))}</code>
+            （${esc(s.rule.original)} → ${esc(s.rule.alias)}），
+            来源原地址 <code>${esc(s.original_range.label)}</code></li>`)
+          .join("")}</ul>
+      </div>`,
+  },
+  {
+    key: "return_ambiguity", title: "③ 回程歧义（别名最长匹配同长并列）",
+    bad: true,
+    body: (e) => `
+      <div class="range-row">歧义别名范围：<br>${rangesHtml(e.ranges)}</div>
+      <div class="meta-row">并列命中规则：
+        ${e.tied_rules.map((r) => `<span class="line-tag">线路 ${esc(r.line)}</span>
+          <code>${esc(ruleId(r))}</code>（别名 ${esc(r.alias)}）`).join("，")}
+      </div>`,
+  },
+  {
+    key: "wrong_line", title: "④ 回错线路（命中规则在另一条线路）",
+    bad: true,
+    body: (e) => `
+      <div class="range-row">别名范围：<br>${rangesHtml(e.ranges)}</div>
+      <div class="meta-row">
+        来源：<span class="line-tag">线路 ${esc(e.source_line)}</span>
+        规则 <code>${esc(ruleId(e.source_rule))}</code><br>
+        实际回程到：<span class="line-tag">线路 ${esc(e.actual_line)}</span>
+        规则 <code>${esc(ruleId(e.winner_rule))}</code>
+        （${esc(e.winner_rule.alias)} 前缀更长）<br>
+        本应回到原地址：<code>${esc(e.expected_original_range.label)}</code>
+      </div>`,
+  },
+  {
+    key: "wrong_address", title: "⑤ 回错地址（反算原地址与来源不一致）",
+    bad: true,
+    body: (e) => `
+      <div class="range-row">别名范围：<br>${rangesHtml(e.ranges)}</div>
+      <div class="meta-row">
+        来源：<span class="line-tag">线路 ${esc(e.source_line)}</span>
+        规则 <code>${esc(ruleId(e.source_rule))}</code><br>
+        回程命中：<span class="line-tag">线路 ${esc(e.winner_rule.line)}</span>
+        规则 <code>${esc(ruleId(e.winner_rule))}</code><br>
+        应到原地址：<code>${esc(e.expected_original_range.label)}</code><br>
+        实际被送到：<code>${esc(e.actual_destination_range.label)}</code>
+      </div>`,
+  },
+];
+
+function renderFindings(findings) {
+  const stack = $("findingsStack");
+  stack.innerHTML = "";
+  let total = 0;
+  for (const meta of FINDING_META) {
+    const entries = findings[meta.key] || [];
+    total += entries.length;
+    const card = document.createElement("div");
+    card.className = "card finding-card" + (entries.length ? " finding-bad" : " finding-ok");
+    card.innerHTML = `<h2>${meta.title}
+        <span class="count-pill ${entries.length ? "pill-bad" : "pill-ok"}">
+          ${entries.length} 组</span></h2>
+      ${entries.length
+        ? entries.map(meta.body).join('<hr class="sep">')
+        : '<p class="hint">✔ 未发现此类问题。</p>'}`;
+    stack.appendChild(card);
   }
+  if (total === 0) toast("核查通过：未发现任何冲突或错路");
 }
 
-function setBatchDisabled(d) {
-  $("btnAckAll").disabled = d;
-  $("btnAckRandom").disabled = d;
-}
-
-/* ---------------- 事件绑定 ---------------- */
-
-function bind() {
-  document.querySelectorAll("[data-preset]").forEach((b) =>
-    b.addEventListener("click", () => applyPreset(b.dataset.preset)));
-
-  ["cfg-total", "cfg-start", "cfg-A-mtu", "cfg-A-overhead", "cfg-B-mtu", "cfg-B-overhead"]
-    .forEach((id) => $(id).addEventListener("input", refreshEffLabels));
-
-  $("btnReset").addEventListener("click", async () => {
-    const cfg = readConfig();
-    if (!Number.isFinite(cfg.total_bytes) || cfg.total_bytes < 1) {
-      showToast("请输入合法的报表字节数", true); return;
-    }
-    const r = await act("/api/reset", cfg, "已按新参数重置演练");
-    if (r) refreshEffLabels();
+// ---- 事件绑定 ----
+$("btnCheck").addEventListener("click", runCheck);
+$("btnClear").addEventListener("click", () => {
+  ["segA", "ruleA", "segB", "ruleB"].forEach((id) => ($(id).value = ""));
+});
+document.querySelectorAll("[data-preset]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const p = PRESETS[btn.dataset.preset];
+    $("segA").value = p.segA;
+    $("ruleA").value = p.ruleA;
+    $("segB").value = p.segB;
+    $("ruleB").value = p.ruleB;
+    runCheck();
   });
-
-  $("btnSendOne").addEventListener("click", () => act("/api/send-next"));
-  $("btnBurst").addEventListener("click", () => {
-    const n = Number($("burstCount").value);
-    if (!Number.isInteger(n) || n < 1) { showToast("连发包数需为正整数", true); return; }
-    act("/api/send-burst", { count: n }, `已连续发出 ${n} 包（或发到报表末尾）`);
-  });
-  $("btnBurstAll").addEventListener("click", () =>
-    act("/api/send-burst", { count: "all" }, "已连续发完所有剩余新包"));
-  $("btnResendMissing").addEventListener("click", () => act("/api/resend-missing"));
-
-  $("btnSwitchA").addEventListener("click", () =>
-    act("/api/switch", { line: "A" }, "已换到线路 A，载荷重置并重发"));
-  $("btnSwitchB").addEventListener("click", () =>
-    act("/api/switch", { line: "B" }, "已换到线路 B，载荷重置并重发"));
-
-  $("btnAckAll").addEventListener("click", () => batchAck("all"));
-  $("btnAckRandom").addEventListener("click", () => batchAck("random-one"));
-
-  /* 报文行内按钮（事件委托） */
-  $("packetRows").addEventListener("click", async (ev) => {
-    const btn = ev.target.closest("button[data-act]");
-    if (!btn) return;
-    const id = btn.dataset.id;
-    const action = btn.dataset.act;
-    if (action === "ack") await act(`/api/packets/${id}/ack`);
-    if (action === "timeout") await act(`/api/packets/${id}/timeout`);
-    if (action === "notice") await act(`/api/packets/${id}/deliver-notice`);
-  });
-}
-
-bind();
-refreshEffLabels();
-loadState();
-setInterval(loadState, 2500);
+});
